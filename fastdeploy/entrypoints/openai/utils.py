@@ -49,21 +49,27 @@ UVICORN_CONFIG = {
                 "ERROR": "red",
                 "CRITICAL": "red,bg_white",
             },
-        }
+        },
+        # Plain formatter for stderr (no ANSI color codes in log files)
+        "plain": {
+            "class": "logging.Formatter",
+            "format": "%(levelname)-8s %(asctime)s %(process)-5s %(filename)s[line:%(lineno)d] %(message)s",
+            "datefmt": "%Y-%m-%d %H:%M:%S",
+        },
     },
     "handlers": {
-        # INFO/DEBUG logs go to stdout
+        # INFO/DEBUG logs go to stdout (colorlog)
         "default": {
             "class": "colorlog.StreamHandler",
             "stream": "ext://sys.stdout",
             "formatter": "custom",
         },
-        # ERROR+ logs go to stderr
+        # ERROR+ logs go to stderr (standard StreamHandler, no colorlog dependency)
         "error": {
-            "class": "colorlog.StreamHandler",
+            "class": "logging.StreamHandler",
             "stream": "ext://sys.stderr",
             "level": "ERROR",
-            "formatter": "custom",
+            "formatter": "plain",
         },
     },
     "loggers": {

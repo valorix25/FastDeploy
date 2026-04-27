@@ -14,10 +14,34 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import logging
+import sys
 import types
 from unittest import mock
 
 from fastdeploy.engine.sched.scheduler_metrics_logger import SchedulerMetricsLogger
+from fastdeploy.logger.logger import _LOG_FORMAT
+
+
+def _reset_scheduler_metrics_logger():
+    logger = logging.getLogger("fastdeploy.scheduler_metrics")
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+    if hasattr(logger, "_fd_scheduler_metrics_configured"):
+        delattr(logger, "_fd_scheduler_metrics_configured")
+    return logger
+
+
+def test_scheduler_metrics_logger_uses_unified_format_and_stdout():
+    raw_logger = _reset_scheduler_metrics_logger()
+
+    logger = SchedulerMetricsLogger(enabled=True, dp_rank=0)
+
+    assert logger._logger is raw_logger
+    assert len(raw_logger.handlers) == 1
+    handler = raw_logger.handlers[0]
+    assert handler.stream is sys.stdout
+    assert handler.formatter._fmt == _LOG_FORMAT
 
 
 def test_on_decode_tokens_accumulates():

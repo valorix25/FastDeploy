@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import io
 import logging
 import os
 import shutil
@@ -76,7 +77,7 @@ class LoggerTests(unittest.TestCase):
         self.assertEqual(legacy_logger.level, logging.INFO)
 
         # Verify handlers
-        self.assertEqual(len(legacy_logger.handlers), 3)  # file + error + console
+        self.assertEqual(len(legacy_logger.handlers), 4)  # file + error + stdout + stderr
 
     def test_logger_propagate(self):
         """Test log propagation settings"""
@@ -102,7 +103,21 @@ class LoggerTests(unittest.TestCase):
         logger = self.logger.get_trace_logger("test_trace_console", "trace_console_test.log", print_to_console=True)
 
         # Verify handler count
-        self.assertEqual(len(logger.handlers), 3)  # main log + error log + console
+        self.assertEqual(len(logger.handlers), 4)  # main log + error log + stdout + stderr
+
+    def test_legacy_console_routes_info_to_stdout_and_error_to_stderr(self):
+        """Test legacy console output stream routing"""
+        with patch("sys.stdout", new_callable=io.StringIO) as stdout, patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            logger = self.logger._get_legacy_logger("test_console_route", "route.log", print_to_console=True)
+            logger.info("info-message")
+            logger.error("error-message")
+            for handler in logger.handlers:
+                handler.flush()
+
+            self.assertIn("info-message", stdout.getvalue())
+            self.assertNotIn("info-message", stderr.getvalue())
+            self.assertNotIn("error-message", stdout.getvalue())
+            self.assertIn("error-message", stderr.getvalue())
 
     def test_get_trace_logger_without_formatter(self):
         """Test trace logger without formatting"""
