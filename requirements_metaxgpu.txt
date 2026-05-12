@@ -18,13 +18,13 @@ tool_helpers
 cupy-cuda12x
 pybind11[global]
 tabulate
-gradio
+gradio>=4.0.0,<6.0.0
 xlwt
-visualdl
+visualdl>=2.5.3
 setuptools-scm>=8
 prometheus-client
 decord
-moviepy
+moviepy>=1.0.3,<2.0.0
 triton
 use-triton-in-paddle
 crcmod
