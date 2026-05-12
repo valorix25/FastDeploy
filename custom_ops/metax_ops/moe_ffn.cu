@@ -85,9 +85,12 @@ void MoeFFNKernel(paddle::Tensor& permute_input,
     throw std::runtime_error("Unsupported gemm method: " + quant_method);
   }
 
-  // swiglu
-  auto act_out_tensor = paddle::experimental::swiglu(fc1_out_tensor, nullptr);
-  auto act_out = act_out_tensor.data<data_t>();
+  // swiglu — P4 optimization: in-place kernel replaces paddle::experimental::swiglu
+  launch_swiglu_inplace(reinterpret_cast<maca_bfloat16*>(fc1_out_ptr),
+                        expanded_active_expert_rows,
+                        inter_size / 2,
+                        stream);
+  auto act_out = fc1_out_ptr;
 
   auto fc2_expert_scales =
       const_cast<paddle::Tensor*>(down_proj_scale.get_ptr())->data<data_t>();

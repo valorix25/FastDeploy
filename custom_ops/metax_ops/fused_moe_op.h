@@ -19,6 +19,7 @@
 
 #include <cuda.h>
 #include <cuda_fp16.h>
+#include <cuda_runtime.h>
 #include "mctlass/functional.h"
 #include "mctlass/numeric_conversion.h"
 // Ignore CUTLASS warnings about type punning
@@ -1559,4 +1560,152 @@ void finalize_moe_routing_kernelLauncher(
                                        routed_scaling_factor,
                                        num_rows);
 }
+
+// =====================================================================
+// P3 Optimization: Atomic expert counting kernel
+// Each thread atomically increments its expert's counter. Replaces the
+// binary-search based compute_total_rows_before_expert kernel.
+// =====================================================================
+__global__ void atomic_moe_expert_counts(
+    const int* __restrict__ permuted_experts,
+    int32_t* __restrict__ counts,
+    const int64_t num_entries,
+    const int64_t num_experts) {
+  const int64_t idx =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx < num_entries) {
+    const int expert_id = permuted_experts[idx];
+    if (expert_id >= 0 && expert_id < num_experts) {
+      atomicAdd(&counts[expert_id], 1);
+    }
+  }
+}
+
+// =====================================================================
+// P4 Optimization: In-place SwiGLU fusion kernel
+// Replaces paddle::experimental::swiglu() — eliminates tensor allocation
+// and Paddle framework dispatch overhead.
+// Input: [M, 2*D] (up_proj || gate_proj concatenated), output overwrites
+// first half [M, D] with silu(gate) * up in-place.
+// =====================================================================
+template <int VecSize>
+__global__ void swiglu_inplace_bf16_kernel(
+    maca_bfloat16* __restrict__ fc1_out,
+    const int64_t M,
+    const int64_t D) {
+  using VecT = AlignedVector<maca_bfloat16, VecSize>;
+  const int64_t total_out_elems = M * D;
+  const int64_t global_tid =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t total_threads = gridDim.x * blockDim.x;
+
+  for (int64_t out_idx = global_tid * VecSize;
+       out_idx < total_out_elems;
+       out_idx += total_threads * VecSize) {
+    const int64_t row = out_idx / D;
+    const int64_t col = out_idx % D;
+    const int64_t up_base   = row * (2 * D) + col;
+    const int64_t gate_base = up_base + D;
+
+    VecT up_vec, gate_vec;
+#pragma unroll
+    for (int v = 0; v < VecSize; ++v) {
+      up_vec[v]   = fc1_out[up_base + v];
+      gate_vec[v] = fc1_out[gate_base + v];
+    }
+#pragma unroll
+    for (int v = 0; v < VecSize; ++v) {
+      float g = static_cast<float>(gate_vec[v]);
+      float u = static_cast<float>(up_vec[v]);
+      float silu = g / (1.0f + expf(-g));
+      fc1_out[out_idx + v] = static_cast<maca_bfloat16>(silu * u);
+    }
+  }
+}
+
+inline void launch_swiglu_inplace(maca_bfloat16* fc1_out,
+                                  const int64_t M,
+                                  const int64_t inter_dim,
+                                  cudaStream_t stream) {
+  constexpr int VecSize = 8;  // 16 bytes = 8 x BF16
+  constexpr int threads_per_block = 256;
+  const int64_t total_elems = M * inter_dim;
+  const int64_t num_threads_needed =
+      (total_elems + VecSize - 1) / VecSize;
+  const int num_blocks = static_cast<int>(
+      min((num_threads_needed + threads_per_block - 1) / threads_per_block,
+          static_cast<int64_t>(4096)));
+  const int actual_blocks = max(1, num_blocks);
+
+  swiglu_inplace_bf16_kernel<VecSize>
+      <<<actual_blocks, threads_per_block, 0, stream>>>(fc1_out, M, inter_dim);
+}
+
+// =====================================================================
+// P3 Optimization: Fused routing + prefix sum kernel
+// Combines initialize_moe_routing (permutation) + compute_total_rows_before_expert
+// (prefix sum) into a single kernel launch, eliminating the standalone
+// binary-search prefix sum kernel after the CUB radix sort.
+// =====================================================================
+template <typename T, int VecSize>
+__global__ void fused_moe_routing_and_prefixsum_kernel(
+    const T* __restrict__ unpermuted_input,
+    T* __restrict__ permuted_output,
+    const int* __restrict__ expanded_dest_row_to_expanded_source_row,
+    int* __restrict__ permuted_experts,    // expert id per expanded dest row
+    int32_t* __restrict__ total_rows_before_expert,
+    const int64_t num_rows,
+    const int64_t cols,
+    const int64_t num_rows_k,
+    const int64_t active_rows,
+    const int64_t num_experts) {
+  const int64_t expanded_dest_row =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+
+  // --- Part 1: Prefix sum via atomicAdd (one thread per expanded_dest_row) ---
+  if (expanded_dest_row < num_rows_k) {
+    const int expert_id = permuted_experts[expanded_dest_row];
+    atomicAdd(&total_rows_before_expert[expert_id], 1);
+  }
+  __threadfence();
+
+  // --- Part 2: Permutation (only for active rows) ---
+  if (expanded_dest_row < active_rows) {
+    const int source_row =
+        expanded_dest_row_to_expanded_source_row[expanded_dest_row] % num_rows;
+    const T* source_row_ptr = unpermuted_input + source_row * cols;
+    T* dest_row_ptr = permuted_output + expanded_dest_row * cols;
+
+    for (int64_t tid = 0; tid < cols / VecSize; ++tid) {
+      AlignedVector<T, VecSize> src_vec;
+      Load<T, VecSize>(&source_row_ptr[tid * VecSize], &src_vec);
+      Store<T, VecSize>(src_vec, &dest_row_ptr[tid * VecSize]);
+    }
+  }
+}
+
+inline void launch_fused_routing_prefixsum(
+    const maca_bfloat16* unpermuted_input,
+    maca_bfloat16* permuted_output,
+    const int* expanded_dest_row_to_expanded_source_row,
+    int* permuted_experts,
+    int32_t* total_rows_before_expert,
+    const int64_t num_rows,
+    const int64_t cols,
+    const int64_t num_experts,
+    cudaStream_t stream) {
+  constexpr int VecSize = 8;  // 8 x BF16 = 16 bytes
+  constexpr int threads_per_block = 256;
+  const int64_t total_threads = num_rows;  // one thread per expanded dest row
+  const int num_blocks = static_cast<int>(
+      (total_threads + threads_per_block - 1) / threads_per_block);
+
+  fused_moe_routing_and_prefixsum_kernel<maca_bfloat16, VecSize>
+      <<<num_blocks, threads_per_block, 0, stream>>>(
+          unpermuted_input, permuted_output,
+          expanded_dest_row_to_expanded_source_row,
+          permuted_experts, total_rows_before_expert,
+          num_rows, cols, num_rows, num_rows, num_experts);
+}
+
 }  // namespace phi

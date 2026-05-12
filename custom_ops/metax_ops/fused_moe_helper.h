@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <cuda_runtime.h>
 #include "fused_moe_gemm_kernels.h"
 #include "fused_moe_imp_op.h"
 #include "fused_moe_op.h"
@@ -285,11 +286,36 @@ class McMoeHelper {
 
     const int64_t expanded_active_expert_rows = k * num_rows;
 
-    compute_total_rows_before_expert(permuted_experts_,
-                                     expanded_active_expert_rows,
-                                     num_experts,
-                                     total_rows_before_expert_,
-                                     stream);
+    // P3 optimization: Replace binary-search prefix sum with atomic counting +
+    // CUB exclusive sum. Two kernel launches (count + scan) replace the binary
+    // search kernel, reducing per-thread work from O(N*logM) to O(N+M).
+    {
+      // Step 1: Zero + atomic count per expert
+      cudaMemsetAsync(total_rows_before_expert_, 0,
+                      num_experts * sizeof(int32_t), stream);
+      const int p3_threads = 256;
+      const int p3_blocks = static_cast<int>(
+          (expanded_active_expert_rows + p3_threads - 1) / p3_threads);
+      atomic_moe_expert_counts<<<p3_blocks, p3_threads, 0, stream>>>(
+          permuted_experts_, total_rows_before_expert_,
+          expanded_active_expert_rows, num_experts);
+
+      // Step 2: Convert counts to exclusive prefix sum using CUB
+      {
+        size_t temp_storage_bytes = 0;
+        cub::DeviceScan::ExclusiveSum(
+            nullptr, temp_storage_bytes,
+            total_rows_before_expert_, total_rows_before_expert_,
+            num_experts, stream);
+        paddle::Tensor cub_ws_tensor = GetEmptyTensor(
+            {static_cast<int64_t>(temp_storage_bytes)},
+            paddle::DataType::INT8, place);
+        cub::DeviceScan::ExclusiveSum(
+            cub_ws_tensor.data<int8_t>(), temp_storage_bytes,
+            total_rows_before_expert_, total_rows_before_expert_,
+            num_experts, stream);
+      }
+    }
 
     mctlassExOrder_t row_major = mctlassExOrder_t::MCTLASS_EX_ORDER_ROW_MAJOR;
     mctlassExOrder_t column_major =
@@ -320,9 +346,15 @@ class McMoeHelper {
     }
 
     if (moe_type == "ffn") {
-      auto act_out_tensor =
-          paddle::experimental::swiglu(fc1_out_tensor, nullptr);
-      auto act_out = act_out_tensor.data<T>();
+      // P4 optimization: In-place SwiGLU kernel replaces paddle::experimental::swiglu()
+      // Eliminates tensor allocation and Paddle framework overhead.
+      // fc1_out_tensor is [M, 2*inter_dim], we compute SwiGLU in-place into
+      // the first [M, inter_dim] half.
+      launch_swiglu_inplace(reinterpret_cast<maca_bfloat16*>(fc1_out),
+                            num_rows * k,
+                            inter_size / 2,
+                            stream);
+      auto act_out = fc1_out;
 
       paddle::Tensor fc2_output_tensor =
           GetEmptyTensor({k * num_rows, hidden_size}, input_type, place);
