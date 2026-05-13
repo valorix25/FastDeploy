@@ -115,11 +115,11 @@ class Predictor(object):
         pass
 
 class PaddleXPredictor(Predictor):
-    def __init__(self, config_path):
+    def __init__(self, config_path, device=None):
         from paddlex import create_pipeline
 
         super().__init__()
-        self.pipeline = create_pipeline(config_path)
+        self.pipeline = create_pipeline(config_path, device=device)
         patch_skip_vlm_labels(self.pipeline)
 
     def _predict(self, batch_data):
@@ -141,6 +141,10 @@ if __name__ == "__main__":
                         help="Physical GPU IDs for monitoring only (not for inference device selection)")
     parser.add_argument("--warmup-rounds", type=int, default=2,
                         help="Number of warmup batches to run before measuring (0 to disable)")
+    parser.add_argument("--warmup-dir", type=str, default="/data/OmniDocBench_v1_5/images_1",
+                        help="Directory containing images used ONLY for warmup (not in benchmark data)")
+    parser.add_argument("--device", type=str, default="metax_gpu:0",
+                        help="Device for PaddleX pipeline inference (e.g. metax_gpu:0, cpu)")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -154,7 +158,7 @@ if __name__ == "__main__":
         print("No valid data")
         sys.exit(1)
 
-    predictor = PaddleXPredictor(args.paddlex_config_path)
+    predictor = PaddleXPredictor(args.paddlex_config_path, device=args.device)
     predictor.tokenizer = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
 
     if args.batch_size < 1:
@@ -168,20 +172,22 @@ if __name__ == "__main__":
     )
     thread_device_monitor.start()
 
-    # # === Warmup phase: send dummy requests to warm up server (JIT compile, CUDAGraph replay, etc.) ===
-    # warmup_rounds = args.warmup_rounds
-    # if warmup_rounds > 0 and len(all_input_paths) >= args.batch_size:
-    #     warmup_samples = all_input_paths[:args.batch_size * min(warmup_rounds, len(all_input_paths) // args.batch_size)]
-    #     print(f"[Warmup] Running {warmup_rounds} warmup batches ({len(warmup_samples)} images)...")
-    #     warmup_batch = []
-    #     for idx, input_path in enumerate(warmup_samples):
-    #         warmup_batch.append(input_path)
-    #         if len(warmup_batch) == args.batch_size or idx == len(warmup_samples) - 1:
-    #             predictor.predict(new_task_info(), warmup_batch)
-    #             warmup_batch.clear()
-    #     print("[Warmup] Done.")
-    #     # Reset GPU monitor counters (discard warmup data)
-    #     gpu_metrics_list.clear()
+    # === Warmup phase: send real requests to warm up server (JIT compile, CUDAGraph replay, etc.) ===
+    # Uses ONLY images from --warmup-dir, which are guaranteed NOT to be in the benchmark dataset
+    warmup_rounds = args.warmup_rounds
+    if warmup_rounds > 0:
+        warmup_paths = sorted(glob.glob(os.path.join(args.warmup_dir, "*")))
+        if warmup_paths:
+            # Pad warmup_paths by cycling so every batch reaches batch_size.
+            total_needed = warmup_rounds * args.batch_size
+            warmup_paths = (warmup_paths * ((total_needed // len(warmup_paths)) + 2))[:total_needed]
+            print(f"[Warmup] Running {warmup_rounds} warmup batch(es) of size {args.batch_size} "
+                  f"using {len(warmup_paths)} padded image(s) from {args.warmup_dir}...")
+            for i in range(0, len(warmup_paths), args.batch_size):
+                predictor.predict(new_task_info(), warmup_paths[i:i + args.batch_size])
+            print("[Warmup] Done.")
+            # Reset GPU monitor counters (discard warmup data)
+            gpu_metrics_list.clear()
 
     # === Benchmark phase ===
     try:

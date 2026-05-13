@@ -88,6 +88,10 @@ SubModules:
     genai_config:
       backend: fastdeploy-server
       server_url: http://127.0.0.1:8118/v1
+      max_concurrency: 64
+      client_kwargs:
+        timeout: 600.0
+        max_retries: 5
 
 SubPipelines:
   DocPreprocessor:

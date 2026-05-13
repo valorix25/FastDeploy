@@ -1566,7 +1566,7 @@ void finalize_moe_routing_kernelLauncher(
 // Each thread atomically increments its expert's counter. Replaces the
 // binary-search based compute_total_rows_before_expert kernel.
 // =====================================================================
-__global__ void atomic_moe_expert_counts(
+__inline__ __global__ void atomic_moe_expert_counts(
     const int* __restrict__ permuted_experts,
     int32_t* __restrict__ counts,
     const int64_t num_entries,
@@ -1589,7 +1589,7 @@ __global__ void atomic_moe_expert_counts(
 // first half [M, D] with silu(gate) * up in-place.
 // =====================================================================
 template <int VecSize>
-__global__ void swiglu_inplace_bf16_kernel(
+__inline__ __global__ void swiglu_inplace_bf16_kernel(
     maca_bfloat16* __restrict__ fc1_out,
     const int64_t M,
     const int64_t D) {
