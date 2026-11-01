@@ -10,7 +10,7 @@ echo "=========================================="
 
 # 保存原始环境变量
 ORIG_PATH=$PATH
-ORIG_LD_LIBRARY_PATH=$LD_LIBRARY_PATH
+ORIG_LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}
 
 # 设置 Metax 编译环境 (仅在当前 shell)
 export MACA_PATH=/opt/maca

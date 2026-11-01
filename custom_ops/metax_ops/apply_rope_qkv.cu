@@ -310,6 +310,12 @@ std::vector<paddle::Tensor> ApplyRopeQKV(const paddle::Tensor& qkv,
       "The last dimension (head_dim) of qkv must be an even number "
       "for RoPE, but got %d",
       head_dim);
+  PADDLE_ENFORCE_EQ(
+      head_dim % 8,
+      0,
+      "The last dimension (head_dim) of qkv must be a multiple of 8 "
+      "for the Vec4 rotate-half kernel, but got %d",
+      head_dim);
   PADDLE_ENFORCE_EQ(q_out.shape().back(),
                     rot_cos.shape().back(),
                     "The last dimension of cos mismatches that of q, "
@@ -350,15 +356,25 @@ std::vector<paddle::Tensor> ApplyRopeQKV(const paddle::Tensor& qkv,
 std::vector<std::vector<int64_t>> ApplyRopeQKVInferShape(
     const std::vector<int64_t>& qkv_shape,
     const std::vector<int64_t>& cos_shape,
-    const std::vector<int64_t>& sin_shape) {
-  return {qkv_shape, cos_shape, sin_shape};
+    const std::vector<int64_t>& sin_shape,
+    const int q_head_num,
+    const int kv_head_num,
+    const int head_dim) {
+  if (cos_shape.size() == 3) {
+    return {{qkv_shape[0], q_head_num, head_dim},
+            {qkv_shape[0], kv_head_num, head_dim},
+            {qkv_shape[0], kv_head_num, head_dim}};
+  }
+  return {{qkv_shape[0], 1, q_head_num, head_dim},
+          {qkv_shape[0], 1, kv_head_num, head_dim},
+          {qkv_shape[0], 1, kv_head_num, head_dim}};
 }
 
 std::vector<paddle::DataType> ApplyRopeQKVInferDtype(
     const paddle::DataType& qkv_dtype,
     const paddle::DataType& cos_dtype,
     const paddle::DataType& sin_dtype) {
-  return {qkv_dtype, cos_dtype, sin_dtype};
+  return {qkv_dtype, qkv_dtype, qkv_dtype};
 }
 
 PD_BUILD_OP(apply_rope_qkv)
